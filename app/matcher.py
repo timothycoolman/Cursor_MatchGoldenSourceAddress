@@ -14,6 +14,18 @@ from .config import Settings, get_settings
 from .normalizer import normalize_address
 
 
+FUZZY_LIST_MIN_SCORE = 85
+
+
+@dataclass
+class MatchCandidate:
+    """Represents a single address hit returned to the caller."""
+
+    matched_address: str
+    confidence: float
+    golden_record: Dict[str, Any]
+
+
 @dataclass
 class MatchResult:
     """Structured result returned by the matcher."""
@@ -24,6 +36,8 @@ class MatchResult:
     normalized_input: str
     matched_address: Optional[str]
     golden_record: Optional[Dict[str, Any]]
+    match_count: int
+    matches: List[MatchCandidate]
 
 
 class AddressMatcher:
@@ -66,6 +80,8 @@ class AddressMatcher:
                 normalized_input="",
                 matched_address=None,
                 golden_record=None,
+                match_count=0,
+                matches=[],
             )
 
         normalized_input = normalize_address(input_address)
@@ -77,12 +93,18 @@ class AddressMatcher:
                 normalized_input=normalized_input,
                 matched_address=None,
                 golden_record=None,
+                match_count=0,
+                matches=[],
             )
 
         exact_candidates = self._exact_lookup.get(normalized_input)
         if exact_candidates:
             # Return the first exact match; deterministic because of load order.
             entry = exact_candidates[0]
+            match_entries = [
+                _build_candidate(candidate, confidence=1.0)
+                for candidate in exact_candidates
+            ]
             return MatchResult(
                 match_type="exact_match",
                 confidence=1.0,
@@ -90,15 +112,19 @@ class AddressMatcher:
                 normalized_input=normalized_input,
                 matched_address=entry["display_address"],
                 golden_record=entry["record"],
+                match_count=len(match_entries),
+                matches=match_entries,
             )
 
-        best_match = process.extractOne(
+        fuzzy_candidates = process.extract(
             normalized_input,
             self._choices,
             scorer=fuzz.WRatio,
+            score_cutoff=FUZZY_LIST_MIN_SCORE,
+            limit=None,
         )
 
-        if not best_match:
+        if not fuzzy_candidates:
             return MatchResult(
                 match_type="no_match",
                 confidence=0.0,
@@ -106,27 +132,40 @@ class AddressMatcher:
                 normalized_input=normalized_input,
                 matched_address=None,
                 golden_record=None,
+                match_count=0,
+                matches=[],
             )
 
-        _, score, index = best_match
-        if score < self.settings.fuzzy_match_threshold:
+        best_score = fuzzy_candidates[0][1]
+        best_index = fuzzy_candidates[0][2]
+
+        if best_score < self.settings.fuzzy_match_threshold:
             return MatchResult(
                 match_type="no_match",
-                confidence=score / 100.0,
+                confidence=best_score / 100.0,
                 input_address=input_address,
                 normalized_input=normalized_input,
                 matched_address=None,
                 golden_record=None,
+                match_count=0,
+                matches=[],
             )
 
-        entry = self._records[index]
+        match_entries: List[MatchCandidate] = []
+        for _, score, index in fuzzy_candidates:
+            entry = self._records[index]
+            match_entries.append(_build_candidate(entry, score / 100.0))
+
+        entry = self._records[best_index]
         return MatchResult(
             match_type="fuzzy_match",
-            confidence=score / 100.0,
+            confidence=best_score / 100.0,
             input_address=input_address,
             normalized_input=normalized_input,
             matched_address=entry["display_address"],
             golden_record=entry["record"],
+            match_count=len(match_entries),
+            matches=match_entries,
         )
 
 
@@ -201,3 +240,11 @@ def get_matcher() -> AddressMatcher:
     """Return a cached matcher instance for reuse across requests."""
 
     return AddressMatcher()
+
+
+def _build_candidate(entry: Dict[str, Any], confidence: float) -> MatchCandidate:
+    return MatchCandidate(
+        matched_address=entry["display_address"],
+        confidence=confidence,
+        golden_record=entry["record"],
+    )
